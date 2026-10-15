@@ -1,0 +1,152 @@
+name: Arch packages
+
+# Builds an Arch Linux package (strata-bin) for every release tag published
+# by lgse/strata, and attaches the packages to a matching release in this
+# repository so they can be installed locally with `pacman -U`.
+#
+# Triggers:
+#   * schedule           - hourly poll; packages every upstream tag that this
+#                          repository has not packaged yet
+#   * workflow_dispatch  - on demand; target = "latest", "all", or tag(s)
+#   * push               - re-runs the pipeline when packaging files change
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Upstream release(s) to package: "latest", "all", or tag(s) like v1.0.0'
+        required: true
+        default: 'latest'
+  push:
+    branches: [main]
+    paths:
+      - 'PKGBUILD'
+      - 'scripts/**'
+      - '.github/workflows/package.yml'
+
+permissions:
+  contents: read
+
+# Never overlap: releases must be published in one piece.
+concurrency:
+  group: arch-packages-${{ github.event_name == 'schedule' && 'schedule' || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  find-releases:
+    name: Find upstream releases to package
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+      has_work: ${{ steps.find.outputs.has_work }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Collect un-packaged lgse/strata releases
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            schedule) set -- all ;;
+            push) set -- latest ;;
+            workflow_dispatch)
+              read -r -a requested <<< "$TARGET"
+              set -- "${requested[@]}"
+              ;;
+          esac
+          ./scripts/pending-releases.sh "$@"
+
+  package:
+    name: Package ${{ matrix.release.tag }} (${{ matrix.arch }})
+    needs: find-releases
+    if: needs.find-releases.outputs.has_work == 'true'
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    container: archlinux:base-devel
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        release: ${{ fromJSON(needs.find-releases.outputs.matrix) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install packaging tools
+        run: pacman -Syu --noconfirm --needed namcap
+
+      - name: Create an unprivileged build user
+        run: |
+          useradd --create-home builder
+          printf 'builder ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/builder
+          chown -R builder .
+
+      - name: Sync the PKGBUILD with upstream ${{ matrix.release.tag }}
+        env:
+          TAG: ${{ matrix.release.tag }}
+        run: sudo -u builder ./scripts/sync-pkgbuild.sh "$TAG"
+
+      - name: Build the package
+        run: sudo -u builder makepkg --cleanbuild --syncdeps --noconfirm
+
+      # namcap reports findings without a failing exit status.
+      - name: Lint the package with namcap
+        run: |
+          report=$(namcap PKGBUILD ./*.pkg.tar.zst)
+          printf '%s\n' "$report"
+          if printf '%s\n' "$report" | grep -q ' E: '; then
+            echo 'namcap reported errors (see above).' >&2
+            exit 1
+          fi
+
+      - name: Verify package contents and binary provenance
+        env:
+          RELEASE_VERSION: ${{ matrix.release.version }}
+        run: |
+          archive=$(ls strata-bin-*-${{ matrix.arch }}.pkg.tar.zst)
+          bsdtar -tf "$archive" | grep -qx 'usr/bin/strata'
+          bsdtar -xOf "$archive" usr/share/strata/install-source.toml | grep -q 'package = "strata-bin"'
+          # The packaged binary must be byte-identical to the upstream one.
+          packaged=$(bsdtar -xOf "$archive" usr/bin/strata | sha256sum | cut -d' ' -f1)
+          upstream=$(tar -xOzf "src/strata-${RELEASE_VERSION}-${{ matrix.arch }}-unknown-linux-gnu.tar.gz" \
+            --wildcards '*/strata' | sha256sum | cut -d' ' -f1)
+          if [[ "$packaged" != "$upstream" ]]; then
+            echo "packaged binary differs from the upstream release artifact" >&2
+            exit 1
+          fi
+
+      - name: Upload the package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: strata-bin-${{ matrix.release.pkgver }}-${{ matrix.arch }}
+          path: ./*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish packages to the release page
+    needs: [find-releases, package]
+    if: needs.find-releases.outputs.has_work == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download built packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: strata-bin-*
+          path: dist
+          merge-multiple: true
+
+      - name: Attach packages to per-tag releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MATRIX: ${{ needs.find-releases.outputs.matrix }}
+        run: ./scripts/publish-release.sh "$MATRIX"

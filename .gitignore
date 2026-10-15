@@ -1,0 +1,9 @@
+# makepkg working directories and outputs
+src/
+pkg/
+*.pkg.tar.zst
+*.pkg.tar.zst.sig
+
+# CI / publisher scratch space
+dist/
+SHA256SUMS*.txt
