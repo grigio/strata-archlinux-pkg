@@ -60,9 +60,11 @@ Triggers:
 
 Notes:
 
-* The aarch64 builds run on GitHub's `ubuntu-24.04-arm` runners, which are
-  free for public repositories (they are paid for private ones — on a
-  private fork, trim the `arch` matrix in the workflow to `[x86_64]`).
+* Both architectures build on plain x86_64 runners: `strata-bin` repacks an
+  upstream prebuilt tarball (there is no compilation), so the aarch64 flavor
+  is produced by overriding `CARCH` in a copy of `makepkg.conf` — and CI
+  still byte-compares the packaged binary against upstream's aarch64
+  tarball. No arm runners needed, so this also works on private forks.
 * Scheduled workflows stop firing after ~60 days without repository activity;
   re-enable or trigger manually if the project goes quiet.
 * A run is capped at 25 releases at a time (`MAX_PACKAGES`), draining the
