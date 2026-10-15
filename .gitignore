@@ -4,6 +4,9 @@ pkg/
 *.pkg.tar.zst
 *.pkg.tar.zst.sig
 
+# makepkg source downloads land in the repo root by default
+strata-*.tar.gz
+
 # CI / publisher scratch space
 dist/
 SHA256SUMS*.txt
